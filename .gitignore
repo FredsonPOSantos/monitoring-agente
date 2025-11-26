@@ -1,0 +1,9 @@
+# Dependências do Node.js (pasta pesada e desnecessária)
+node_modules/
+
+# Ficheiro de variáveis de ambiente (contém senhas e segredos)
+.env
+
+# Logs e ficheiros de depuração
+npm-debug.log
+*.log
