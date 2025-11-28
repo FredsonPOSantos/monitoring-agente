@@ -112,6 +112,7 @@ const measurementForcedNumber = {
     'system_health': new Set(['voltage', 'temperature']),
     // Unificado: contém campos de 'print' e 'monitor-traffic'
     'interface_stats': new Set(['mtu','rx_byte','tx_byte','rx-packet','tx-packet','rx-drop','tx-drop','rx-error','tx-error', 'rx_bits_per_second', 'tx_bits_per_second', 'rx_packets_per_second', 'tx_packets_per_second']),
+    'hotspot_active': new Set([]), // Adicionando a nova measurement
     'interface_monitor': new Set(['rx_bits_per_second', 'tx_bits_per_second', 'rx_packets_per_second', 'tx_packets_per_second']),
     // NOVO: Métricas numéricas para clientes wireless
     'interface_wireless_registration_table': new Set(['signal_strength_dbm', 'tx_rate', 'rx_rate', 'tx_bytes', 'rx_bytes', 'tx_packets', 'rx_packets', 'uptime_seconds']),
@@ -185,8 +186,8 @@ const flattenAndWrite = (measurement, item, extraTags = {}, host) => {
         // Apenas processa campos que estão explicitamente definidos como numéricos
         if (measurementForcedNumber[meas] && measurementForcedNumber[meas].has(sk)) {
             if (isNumericString(raw)) {
-                if (raw.indexOf('.') !== -1 || /[eE]/.test(raw)) p.floatField(sk, Number(raw));
-                else p.intField(sk, parseInt(raw, 10));
+                if (raw.indexOf('.') !== -1) p.floatField(sk, Number(raw));
+                else p.intField(sk, parseInt(raw));
             }
         }
         // O resto (campos de string) é ignorado para evitar conflitos, conforme solicitado.
@@ -199,6 +200,24 @@ const flattenAndWrite = (measurement, item, extraTags = {}, host) => {
     }
 };
 
+/**
+ * Coleta usuários ativos do Hotspot e escreve no InfluxDB.
+ */
+const getHotspotActiveUsers = async (conn, host) => {
+    try {
+        console.log(`[API] Coletando usuários ativos do Hotspot em ${host}...`);
+        const activeUsers = await runCommand('/ip/hotspot/active/print');
+        if (!activeUsers || activeUsers.length === 0) {
+            console.log(`[API] Nenhum usuário ativo no Hotspot encontrado em ${host}.`);
+            return;
+        }
+        activeUsers.forEach(user => {
+            flattenAndWrite('hotspot_active', user, { mac_address: user['mac-address'] || 'unknown' }, host);
+        });
+    } catch (e) {
+        console.warn(`[API] Falha ao coletar usuários do Hotspot em ${host}: ${e.message}`);
+    }
+};
     try {
         await doConnect();
         console.log(`[API] Conectado com sucesso a ${host}. Coletando métricas...`);
@@ -273,6 +292,9 @@ const flattenAndWrite = (measurement, item, extraTags = {}, host) => {
         } catch (e) {
             console.warn(`[API] Falha ao coletar métricas de interface em ${host}: ${e.message}`);
         }
+
+        // Coleta de usuários do Hotspot
+        await getHotspotActiveUsers(client, host);
 
         await doClose();
         console.log(`[API] Métricas coletadas de ${host}.`);
