@@ -54,7 +54,138 @@ const influxDB = new InfluxDB({ url: INFLUX_URL, token: INFLUX_TOKEN });
 const writeApi = influxDB.getWriteApi(INFLUX_ORG, INFLUX_BUCKET);
 console.log(`[INFLUXDB] Cliente configurado para o bucket: ${INFLUX_BUCKET} 🚀`);
 
-// --- 3. Lógica de Coleta de Métricas ---
+// Insira a seguir: utilitários e flattenAndWrite em escopo global
+const sanitizeKey = (k) => String(k).replace(/[^a-zA-Z0-9_]/g,'_').replace(/^_+|_+$/g,'').toLowerCase();
+const isNumericString = (s) => /^[+-]?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(String(s).trim());
+
+/**
+ * Converte a string de tempo do MikroTik (ex: 1w2d3h4m5s) para segundos.
+ * @param {string} timeStr A string de tempo.
+ * @returns {number} O total de segundos.
+ */
+const parseMikroTikTime = (timeStr) => {
+    if (!timeStr || typeof timeStr !== 'string') return 0;
+    
+    let totalSeconds = 0;
+    // Regex para capturar semanas, dias, horas, minutos e segundos
+    const weeks = timeStr.match(/(\d+)w/);
+    const days = timeStr.match(/(\d+)d/);
+    const hours = timeStr.match(/(\d+)h/);
+    const minutes = timeStr.match(/(\d+)m/);
+    const seconds = timeStr.match(/(\d+)s/);
+
+    if (weeks) totalSeconds += parseInt(weeks[1], 10) * 604800;
+    if (days) totalSeconds += parseInt(days[1], 10) * 86400;
+    if (hours) totalSeconds += parseInt(hours[1], 10) * 3600;
+    if (minutes) totalSeconds += parseInt(minutes[1], 10) * 60;
+    if (seconds) totalSeconds += parseInt(seconds[1], 10);
+
+    return totalSeconds;
+};
+
+// Campos a serem completamente ignorados durante a coleta.
+const ignoredFields = {
+    'interface_stats': new Set(['mtu'])
+};
+
+// Força campos específicos a serem tratados como STRING, mesmo que pareçam numéricos.
+// Essencial para IDs, versões, MACs, etc.
+const measurementForcedString = {
+    'interface_stats': new Set(['comment','default_name','disabled','id','mac_address','name','running','slave','type']),
+    'ip_address': new Set(['actual_interface','address','disabled','dynamic','id','interface','invalid','network']),
+    'ip_arp': new Set(['address','complete','dhcp','disabled','dynamic','id','interface','invalid','mac_address','published']),
+    'ip_dhcp_server_lease': new Set(['active_address','active_client_id','active_mac_address','active_server','address','address_lists','blocked','client_id','dhcp_option','disabled','dynamic','host_name','id','radius','server','status', 'age', 'expires_after', 'last_seen']),
+    'system_clock': new Set(['date','dst_active','gmt_offset','time_zone_autodetect','time_zone_name']),
+    'system_health': new Set(['id','name','type']), // 'value' será tratado como número
+    'system_resource': new Set(['architecture_name','board_name','build_time','factory_software','platform','version', 'uptime']),
+    'system_routerboard': new Set(['board_name','current_firmware','factory_firmware','firmware_type','model','routerboard','serial_number','upgrade_firmware']),
+    'user': new Set(['address','disabled','expired','group','id','last_logged_in','name'])
+};
+
+// Força campos específicos a serem tratados como NÚMEROS (inteiro ou float).
+// Crucial para métricas, contadores e valores que serão usados em cálculos e gráficos.
+const measurementForcedNumber = {
+    // Métricas de interface: tráfego, erros, quedas.
+    'interface_stats': new Set([
+        'actual_mtu','l2mtu','max_l2mtu','link_downs',
+        'rx_byte','tx_byte','rx_packet','tx_packet','rx_drop','tx_drop','tx_queue_drop','rx_error','tx_error',
+        'fp_rx_byte','fp_tx_byte','fp_rx_packet','fp_tx_packet',
+        'rx_packets_per_second','tx_packets_per_second','rx_bits_per_second','tx_bits_per_second',
+        'fp_rx_packets_per_second','fp_tx_packets_per_second','fp_rx_bits_per_second','fp_tx_bits_per_second',
+        'rx_drops_per_second','tx_drops_per_second','rx_errors_per_second','tx_errors_per_second','tx_queue_drops_per_second'
+    ]),
+    // Métricas de recursos do sistema: CPU, memória, disco, etc.
+    'system_resource': new Set([
+        'cpu_load','free_memory','total_memory','free_hdd_space','total_hdd_space',
+        'cpu_count','cpu_frequency','bad_blocks','write_sect_since_reboot','write_sect_total',
+        'uptime_seconds' // Garante que a versão convertida seja numérica
+    ]),
+    // Métricas de saúde: voltagem, temperatura.
+    'system_health': new Set(['value']),
+    // Métricas de DHCP: durações convertidas para segundos.
+    'ip_dhcp_server_lease': new Set(['age_seconds', 'expires_after_seconds', 'last_seen_seconds'])
+};
+
+const flattenAndWrite = (measurement, item, extraTags = {}, host) => {
+    const meas = String(measurement).toLowerCase();
+    const p = new Point(meas).tag('router_host', host || 'unknown');
+
+    for (const [k, v] of Object.entries(extraTags || {})) p.tag(sanitizeKey(k), String(v));
+
+    for (const [k, v] of Object.entries(item || {})) {
+        if (v === undefined || v === null) continue;
+        const sk = sanitizeKey(k);
+
+        // Verifica se o campo deve ser ignorado
+        if (ignoredFields[meas] && ignoredFields[meas].has(sk)) {
+            continue;
+        }
+
+        const raw = (typeof v === 'object') ? JSON.stringify(v) : String(v).trim();
+
+        if (measurementForcedString[meas] && measurementForcedString[meas].has(sk)) {
+            p.stringField(sk, raw);
+            continue;
+        }
+
+        if (measurementForcedNumber[meas] && measurementForcedNumber[meas].has(sk)) {
+            if (isNumericString(raw)) {
+                if (raw.indexOf('.') !== -1 || /[eE]/.test(raw)) p.floatField(sk, Number(raw));
+                else p.intField(sk, parseInt(raw, 10));
+            } else {
+                console.warn(`[AGENTE] Campo NUMÉRICO esperado ignorado (não-numérico): ${meas}.${sk}="${raw}" router=${host}`);
+            }
+            continue;
+        }
+
+        if (isNumericString(raw)) {
+            if (raw.indexOf('.') !== -1 || /[eE]/.test(raw)) p.floatField(sk, Number(raw));
+            else {
+                const iv = parseInt(raw, 10);
+                if (Number.isNaN(iv)) p.stringField(sk, raw); else p.intField(sk, iv);
+            }
+        } else {
+            p.stringField(sk, raw);
+        }
+    }
+
+    try {
+        writeApi.writePoint(p);
+    } catch (e) {
+        console.error(`[INFLUXDB] Erro ao escrever ponto ${measurement}:`, e.message);
+    }
+};
+
+/**
+ * Coleta os usuários ativos do Hotspot.
+ * Esta função é um placeholder para implementação futura.
+ */
+const getHotspotActiveUsers = async (host, client, writer) => {
+    // TODO: Implementar a lógica para buscar e escrever os dados de /ip/hotspot/active/print
+    // Por exemplo:
+    // const hotspotUsers = await runCommand('/ip/hotspot/active/print');
+    // hotspotUsers.forEach(user => writer('hotspot_active', user, { user: user.user }, host));
+};
 
 /**
  * Conecta-se a um roteador MikroTik e coleta métricas.
@@ -102,122 +233,6 @@ const collectMetrics = async (host) => {
         }
     };
 
-// NOVO: funções utilitárias e flattenAndWrite movidas para escopo global
-const measurementForcedString = {
-    'ip_firewall_filter': new Set(['dst_port','src_port','dst_address_list','src_address_list','ports','dst_port_list','src_port_list','protocol'])
-};
-// SOLUÇÃO PROBLEMA 1: Forçar campos que devem ser numéricos a serem tratados como tal.
-const measurementForcedNumber = {
-    'system_resource': new Set(['cpu_load', 'free_memory', 'total_memory', 'free_hdd_space', 'total_hdd_space', 'uptime', 'bad_blocks']),
-    'system_health': new Set(['voltage', 'temperature']),
-    // Unificado: contém campos de 'print' e 'monitor-traffic'
-    'interface_stats': new Set(['mtu','rx_byte','tx_byte','rx-packet','tx-packet','rx-drop','tx-drop','rx-error','tx-error', 'rx_bits_per_second', 'tx_bits_per_second', 'rx_packets_per_second', 'tx_packets_per_second']),
-    'hotspot_active': new Set([]), // Adicionando a nova measurement
-    'interface_monitor': new Set(['rx_bits_per_second', 'tx_bits_per_second', 'rx_packets_per_second', 'tx_packets_per_second']),
-    // NOVO: Métricas numéricas para clientes wireless
-    'interface_wireless_registration_table': new Set(['signal_strength_dbm', 'tx_rate', 'rx_rate', 'tx_bytes', 'rx_bytes', 'tx_packets', 'rx_packets', 'uptime_seconds']),
-    'ip_arp': new Set([]), 
-    'ip_dhcp_server_lease': new Set([]), // Nenhum campo numérico óbvio para forçar
-    'system_routerboard': new Set([]),
-    // O campo 'time' em clock é uma string 'HH:mm:ss', não deve ser numérico.
-    'system_clock': new Set([]), 
-    'ip_address': new Set([]),
-    'user': new Set([])
-};
-const sanitizeKey = (k) => String(k).replace(/[^a-zA-Z0-9_]/g,'_').replace(/^_+|_+$/g,'').toLowerCase();
-const isNumericString = (s) => /^[+-]?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(String(s).trim());
-
-/**
- * Converte a string de duração do MikroTik (ex: "1w2d3h4m5s") para segundos.
- * @param {string} durationString A string de duração.
- * @returns {number} O número total de segundos.
- */
-const parseMikroTikUptime = (durationString) => {
-    const match = durationString.match(/(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?/);
-    if (!match) return 0;
-    const weeks = parseInt(match[1] || '0', 10);
-    const days = parseInt(match[2] || '0', 10);
-    const hours = parseInt(match[3] || '0', 10);
-    const minutes = parseInt(match[4] || '0', 10);
-    const seconds = parseInt(match[5] || '0', 10);
-    return (weeks * 604800) + (days * 86400) + (hours * 3600) + (minutes * 60) + seconds;
-};
-
-const flattenAndWrite = (measurement, item, extraTags = {}, host) => {
-    const meas = String(measurement).toLowerCase();
-    const p = new Point(meas).tag('router_host', host || 'unknown');
-
-    for (const [k, v] of Object.entries(extraTags || {})) {
-        p.tag(sanitizeKey(k), String(v));
-    }
-
-    for (const [k, v] of Object.entries(item || {})) {
-        if (v === undefined || v === null) continue;
-        const sk = sanitizeKey(k);
-        const raw = (typeof v === 'object') ? JSON.stringify(v) : String(v).trim();
-
-        // Tratamento especial para uptime (agora genérico para qualquer medição)
-        if (sk === 'uptime') {
-            p.intField('uptime_seconds', parseMikroTikUptime(raw));
-            continue; // Pula para o próximo campo
-        }
-
-        // Tratamento especial para signal-strength (ex: "-55dBm@6Mbps")
-        if (sk === 'signal_strength') {
-            const strengthMatch = raw.match(/^(-?\d+)/);
-            if (strengthMatch) {
-                p.intField('signal_strength_dbm', parseInt(strengthMatch[1], 10));
-            }
-            continue;
-        }
-
-        // Tratamento especial para campos com "tx/rx" (ex: "12345/67890")
-        if (sk === 'bytes' || sk === 'packets') {
-            const parts = raw.split('/');
-            if (parts.length === 2) {
-                const tx = parseInt(parts[0], 10);
-                const rx = parseInt(parts[1], 10);
-                if (!isNaN(tx)) p.intField(`tx_${sk}`, tx);
-                if (!isNaN(rx)) p.intField(`rx_${sk}`, rx);
-            }
-            continue; // Pula para o próximo campo
-        }
-
-        // Apenas processa campos que estão explicitamente definidos como numéricos
-        if (measurementForcedNumber[meas] && measurementForcedNumber[meas].has(sk)) {
-            if (isNumericString(raw)) {
-                if (raw.indexOf('.') !== -1) p.floatField(sk, Number(raw));
-                else p.intField(sk, parseInt(raw));
-            }
-        }
-        // O resto (campos de string) é ignorado para evitar conflitos, conforme solicitado.
-    }
-
-    try {
-        writeApi.writePoint(p);
-    } catch (e) {
-        console.error(`[INFLUXDB] Erro ao escrever ponto ${measurement}:`, e.message);
-    }
-};
-
-/**
- * Coleta usuários ativos do Hotspot e escreve no InfluxDB.
- */
-const getHotspotActiveUsers = async (conn, host) => {
-    try {
-        console.log(`[API] Coletando usuários ativos do Hotspot em ${host}...`);
-        const activeUsers = await runCommand('/ip/hotspot/active/print');
-        if (!activeUsers || activeUsers.length === 0) {
-            console.log(`[API] Nenhum usuário ativo no Hotspot encontrado em ${host}.`);
-            return;
-        }
-        activeUsers.forEach(user => {
-            flattenAndWrite('hotspot_active', user, { mac_address: user['mac-address'] || 'unknown' }, host);
-        });
-    } catch (e) {
-        console.warn(`[API] Falha ao coletar usuários do Hotspot em ${host}: ${e.message}`);
-    }
-};
     try {
         await doConnect();
         console.log(`[API] Conectado com sucesso a ${host}. Coletando métricas...`);
@@ -232,7 +247,9 @@ const getHotspotActiveUsers = async (conn, host) => {
             '/system/health/print',        // Tensão e temperatura
             '/system/routerboard/print',   // Modelo, firmware, número de série
             '/system/clock/print',         // Data e hora do sistema
-            '/ip/address/print',           // Endereços IP configurados
+            '/ip/address/print',           // Endereços IP configurados,
+            '/ip/arp/print',               // Tabela ARP (IPs e MACs na rede)
+            '/ip/dhcp-server/lease/print', // Clientes DHCP ativos
             '/ip/arp/print',               // Tabela ARP (IPs e MACs na rede)
             '/ip/dhcp-server/lease/print', // Clientes DHCP ativos
             '/user/print'                  // Utilizadores configurados no router
@@ -248,6 +265,7 @@ const getHotspotActiveUsers = async (conn, host) => {
         for (const cmd of commands) {
             try {
                 const res = await runCommand(cmd);
+                console.log(`[DADOS] Comando '${cmd}':`, JSON.stringify(res, null, 2));
                 if (!res) continue;
 
                 // normaliza para array
@@ -259,7 +277,16 @@ const getHotspotActiveUsers = async (conn, host) => {
 
                 // escreve cada item como ponto separado
                 rows.forEach(row => {
-                    flattenAndWrite(baseMeasurement, row, {}, host); // SOLUÇÃO PROBLEMA 2: Passar o host
+                    // [NOVO] Converte campos de tempo específicos para segundos
+                    if (baseMeasurement === 'system_resource' && row.uptime) {
+                        row.uptime_seconds = parseMikroTikTime(row.uptime);
+                    }
+                    if (baseMeasurement === 'ip_dhcp_server_lease') {
+                        if (row.age) row.age_seconds = parseMikroTikTime(row.age);
+                        if (row.expires_after) row.expires_after_seconds = parseMikroTikTime(row.expires_after);
+                        if (row.last_seen) row.last_seen_seconds = parseMikroTikTime(row.last_seen);
+                    }
+                    flattenAndWrite(baseMeasurement, row, {}, host);
                 });
             } catch (e) {
                 console.warn(`[API] Falha ao executar comando "${cmd}" em ${host}: ${e.message}`);
@@ -285,6 +312,7 @@ const getHotspotActiveUsers = async (conn, host) => {
                     [`=interface=${name}`, '=once=yes']
                 );
                 const combinedData = Object.assign({}, iface, trafficStats[0] || {});
+                console.log(`[DADOS] Interface '${name}':`, JSON.stringify(combinedData, null, 2));
 
                 // Escreve um único ponto de dados com todas as informações da interface
                 flattenAndWrite('interface_stats', combinedData, { interface_name: name }, host);
@@ -294,7 +322,15 @@ const getHotspotActiveUsers = async (conn, host) => {
         }
 
         // Coleta de usuários do Hotspot
-        await getHotspotActiveUsers(client, host);
+        try {
+            if (typeof getHotspotActiveUsers === 'function') {
+                await getHotspotActiveUsers(host, client, flattenAndWrite);
+            } else {
+                console.warn(`[API] Função getHotspotActiveUsers não definida — pulando coleta de usuários Hotspot para ${host}.`);
+            }
+        } catch (err) {
+            console.error(`[API] Falha ao conectar ou coletar métricas para ${host}: ${err.message}`);
+        }
 
         await doClose();
         console.log(`[API] Métricas coletadas de ${host}.`);
