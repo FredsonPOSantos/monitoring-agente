@@ -1,5 +1,10 @@
 // Carrega as variáveis de ambiente do ficheiro .env
 const dotenv = require('dotenv');
+const path = require('path');
+// [MODIFICADO] Carrega o .env de forma explícita para garantir que o caminho está correto.
+dotenv.config({ path: path.resolve(__dirname, '.env') });
+
+const { Pool } = require('pg'); // [NOVO] Importa o driver do PostgreSQL
 const { InfluxDB, Point } = require('@influxdata/influxdb-client');
 
 // Ajuste da importação para suportar o pacote 'node-routeros' que expõe RouterOSAPI
@@ -21,8 +26,6 @@ if (typeof RouterOSClient !== 'function') {
 }
 
 // --- 1. Configuração Inicial ---
-dotenv.config();
-console.log(`[dotenv@${require('dotenv/package.json').version}] injecting env (${Object.keys(process.env).length}) from .env -- tip: 🛠️ run anywhere with dotenvx run -- yourcommand`);
 
 const INFLUX_URL = process.env.INFLUXDB_URL;
 const INFLUX_TOKEN = process.env.INFLUXDB_TOKEN;
@@ -33,6 +36,12 @@ const MIKROTIK_API_PORT = process.env.MIKROTIK_API_PORT || 8728;
 const MIKROTIK_USER = process.env.MIKROTIK_USER;
 const MIKROTIK_PASSWORD = process.env.MIKROTIK_PASSWORD;
 
+const DB_HOST = process.env.DB_HOST;
+const DB_USER = process.env.DB_USER;
+const DB_PASSWORD = process.env.DB_PASSWORD;
+const DB_DATABASE = process.env.DB_DATABASE;
+const DB_PORT = process.env.DB_PORT;
+
 // Validação das variáveis de ambiente essenciais
 if (!INFLUX_URL || !INFLUX_TOKEN || !INFLUX_ORG || !INFLUX_BUCKET) {
     console.error("❌ Erro: Uma ou mais variáveis de ambiente do InfluxDB (INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG, INFLUX_BUCKET) não estão definidas no seu ficheiro .env.");
@@ -40,13 +49,31 @@ if (!INFLUX_URL || !INFLUX_TOKEN || !INFLUX_ORG || !INFLUX_BUCKET) {
     process.exit(1); // Termina o script com um código de erro.
 }
 
-// Simulação da busca de roteadores no PostgreSQL (Fase 2.1)
-// Em um cenário real, isso viria do seu banco de dados.
+/**
+ * [MODIFICADO] Busca a lista de roteadores diretamente do banco de dados PostgreSQL.
+ * Se as credenciais do banco não estiverem configuradas, usa a variável ROUTER_HOSTS como fallback.
+ */
 const getRoutersFromDB = async () => {
-    // TODO: Implementar a lógica para buscar do PostgreSQL
-    // Por enquanto, usamos uma lista estática para teste.
-    // Correção: Usar a variável ROUTER_HOSTS e dividi-la por vírgula para suportar múltiplos hosts.
-    return process.env.ROUTER_HOSTS ? process.env.ROUTER_HOSTS.split(',') : [];
+    // [MODIFICADO] Simplificado para usar apenas variáveis DB_*
+    if (!DB_HOST || !DB_USER || !DB_DATABASE) {
+        console.warn('[AVISO] Variáveis do PostgreSQL não configuradas. A usar ROUTER_HOSTS do .env como fallback.');
+        if (!DB_HOST) console.warn('  - Causa: A variável de ambiente DB_HOST não foi encontrada no ficheiro .env.');
+        return process.env.ROUTER_HOSTS ? process.env.ROUTER_HOSTS.split(',').map(h => h.trim()) : [];
+    }
+
+    const pool = new Pool({
+        user: DB_USER, host: DB_HOST, database: DB_DATABASE, password: DB_PASSWORD, port: DB_PORT
+    });
+
+    try {
+        const res = await pool.query("SELECT ip_address FROM routers WHERE ip_address IS NOT NULL AND ip_address <> ''");
+        await pool.end();
+        return res.rows.map(row => row.ip_address.trim());
+    } catch (err) {
+        console.error('❌ [PostgreSQL] Erro ao buscar roteadores do banco de dados:', err.message);
+        await pool.end();
+        return []; // Retorna um array vazio em caso de erro para não parar o agente.
+    }
 };
 
 // --- 2. Cliente InfluxDB ---
@@ -85,16 +112,39 @@ const parseMikroTikTime = (timeStr) => {
 
 // Campos a serem completamente ignorados durante a coleta.
 const ignoredFields = {
-    'interface_stats': new Set(['mtu'])
+    'hotspot_active': new Set(['.id']),
+    'system_resource': new Set([
+        'cpu-count', 'total-memory', 'total-hdd-space', 'bad-blocks', 
+        'write-sect-since-reboot', 'write-sect-total', 'architecture-name', 
+        'board-name', 'platform', 'build-time', 'factory-software'
+    ]),
+    'system_clock': new Set([
+        'gmt-offset', 'dst-active', 'time-zone-name', 'time-zone-autodetect'
+    ]),
+    'ip_arp': new Set([
+        '.id', 'dynamic', 'complete', 'published'
+    ]),
+    'ip_dhcp_server_lease': new Set([
+        '.id', 'radius', 'dynamic', 'blocked', 'disabled', 'dhcp-option',
+        'age', 'expires-after', 'last-seen',
+        'age_seconds', 'expires_after_seconds', 'last_seen_seconds'
+    ]),
+    'interface_stats': new Set([
+        'mtu', 'actual-mtu', 'l2mtu', 'max-l2mtu',
+        'fp-rx-byte', 'fp-tx-byte', 'fp-rx-packet', 'fp-tx-packet',
+        'fp-rx-packets-per-second', 'fp-tx-packets-per-second',
+        'fp-rx-bits-per-second', 'fp-tx-bits-per-second'
+    ])
 };
 
 // Força campos específicos a serem tratados como STRING, mesmo que pareçam numéricos.
 // Essencial para IDs, versões, MACs, etc.
 const measurementForcedString = {
-    'interface_stats': new Set(['comment','default_name','disabled','id','mac_address','name','running','slave','type']),
+    'hotspot_active': new Set(['.id', 'server', 'user', 'address', 'mac-address', 'uptime', 'session-time-left', 'comment']),
+    'interface_stats': new Set(['comment','default_name','disabled','.id','mac_address','running','slave','type']),
     'ip_address': new Set(['actual_interface','address','disabled','dynamic','id','interface','invalid','network']),
-    'ip_arp': new Set(['address','complete','dhcp','disabled','dynamic','id','interface','invalid','mac_address','published']),
-    'ip_dhcp_server_lease': new Set(['active_address','active_client_id','active_mac_address','active_server','address','address_lists','blocked','client_id','dhcp_option','disabled','dynamic','host_name','id','radius','server','status', 'age', 'expires_after', 'last_seen']),
+    'ip_arp': new Set(['address','dhcp','disabled','.id','interface','invalid','mac_address']),
+    'ip_dhcp_server_lease': new Set(['active_address','active_client_id','active_mac_address','active_server','address','address_lists','client_id','host_name','server','status', 'mac-address']),
     'system_clock': new Set(['date','dst_active','gmt_offset','time_zone_autodetect','time_zone_name']),
     'system_health': new Set(['id','name','type']), // 'value' será tratado como número
     'system_resource': new Set(['architecture_name','board_name','build_time','factory_software','platform','version', 'uptime']),
@@ -107,7 +157,7 @@ const measurementForcedString = {
 const measurementForcedNumber = {
     // Métricas de interface: tráfego, erros, quedas.
     'interface_stats': new Set([
-        'actual_mtu','l2mtu','max_l2mtu','link_downs',
+        'link_downs',
         'rx_byte','tx_byte','rx_packet','tx_packet','rx_drop','tx_drop','tx_queue_drop','rx_error','tx_error',
         'fp_rx_byte','fp_tx_byte','fp_rx_packet','fp_tx_packet',
         'rx_packets_per_second','tx_packets_per_second','rx_bits_per_second','tx_bits_per_second',
@@ -122,8 +172,6 @@ const measurementForcedNumber = {
     ]),
     // Métricas de saúde: voltagem, temperatura.
     'system_health': new Set(['value']),
-    // Métricas de DHCP: durações convertidas para segundos.
-    'ip_dhcp_server_lease': new Set(['age_seconds', 'expires_after_seconds', 'last_seen_seconds'])
 };
 
 const flattenAndWrite = (measurement, item, extraTags = {}, host) => {
@@ -137,7 +185,7 @@ const flattenAndWrite = (measurement, item, extraTags = {}, host) => {
         const sk = sanitizeKey(k);
 
         // Verifica se o campo deve ser ignorado
-        if (ignoredFields[meas] && ignoredFields[meas].has(sk)) {
+        if (ignoredFields[meas] && ignoredFields[meas].has(k)) {
             continue;
         }
 
@@ -178,13 +226,22 @@ const flattenAndWrite = (measurement, item, extraTags = {}, host) => {
 
 /**
  * Coleta os usuários ativos do Hotspot.
- * Esta função é um placeholder para implementação futura.
  */
-const getHotspotActiveUsers = async (host, client, writer) => {
-    // TODO: Implementar a lógica para buscar e escrever os dados de /ip/hotspot/active/print
-    // Por exemplo:
-    // const hotspotUsers = await runCommand('/ip/hotspot/active/print');
-    // hotspotUsers.forEach(user => writer('hotspot_active', user, { user: user.user }, host));
+const getHotspotActiveUsers = async (host, client, writer, runCommand) => {
+    try {
+        const hotspotUsers = await runCommand('/ip/hotspot/active/print');
+        if (hotspotUsers && hotspotUsers.length > 0) {
+            console.log(`[API-DEBUG] Encontrados ${hotspotUsers.length} usuários ativos no Hotspot em ${host}.`);
+            hotspotUsers.forEach(user => {
+                // O 'user' pode não existir para clientes não autenticados, mas o mac_address sim.
+                const tags = user.user ? { user: user.user } : {};
+                writer('hotspot_active', user, tags, host);
+            });
+        }
+    } catch (e) {
+        // Não é um erro crítico se o hotspot não estiver configurado.
+        console.warn(`[API] Aviso ao coletar usuários ativos do Hotspot em ${host}: ${e.message}`);
+    }
 };
 
 /**
@@ -201,6 +258,13 @@ const collectMetrics = async (host) => {
         user: MIKROTIK_USER,
         password: MIKROTIK_PASSWORD,
         timeout: 5,
+    });
+
+    // [NOVO] Adiciona um listener de erro para prevenir que o processo caia.
+    // O erro de timeout é um evento 'error' que, se não for capturado, quebra a aplicação.
+    client.on('error', (err) => {
+        // Apenas registamos o evento aqui. O tratamento principal do erro (a mensagem para o utilizador)
+        // já é feito no bloco `catch` principal desta função.
     });
 
     const doConnect = async () => {
@@ -239,25 +303,27 @@ const collectMetrics = async (host) => {
 
         // --- Verificação de Capacidades (Capabilities) ---
         const packages = await runCommand('/system/package/print');
-        const isWirelessEnabled = packages.some(pkg => pkg.name === 'wireless' && pkg.disabled === 'false');
+        console.log(`[API-DEBUG] Pacotes instalados em ${host}:`, JSON.stringify(packages.map(p => ({ name: p.name, disabled: p.disabled }))));
+        const isWave2Enabled = packages.some(pkg => pkg.name === 'wifiwave2' && pkg.disabled === 'false');
+        const isLegacyWirelessEnabled = packages.some(pkg => pkg.name === 'wireless' && pkg.disabled === 'false');
 
         // --- Construção da Lista de Comandos Dinâmica ---
+        // [MODIFICADO] Comandos removidos e duplicatas limpas.
         const commands = [
             '/system/resource/print',      // Métricas vitais: CPU, memória, uptime
-            '/system/health/print',        // Tensão e temperatura
-            '/system/routerboard/print',   // Modelo, firmware, número de série
             '/system/clock/print',         // Data e hora do sistema
             '/ip/address/print',           // Endereços IP configurados,
-            '/ip/arp/print',               // Tabela ARP (IPs e MACs na rede)
-            '/ip/dhcp-server/lease/print', // Clientes DHCP ativos
             '/ip/arp/print',               // Tabela ARP (IPs e MACs na rede)
             '/ip/dhcp-server/lease/print', // Clientes DHCP ativos
             '/user/print'                  // Utilizadores configurados no router
         ];
 
-        if (isWirelessEnabled) {
-            console.log(`[API] Pacote wireless detectado em ${host}. Coletando métricas de Wi-Fi.`);
-            commands.push('/interface/wireless/registration-table/print');
+        if (isWave2Enabled) {
+            console.log(`[API] Pacote wireless 'wifiwave2' detectado em ${host}. Coletando métricas de Wi-Fi.`);
+            commands.push('/interface/wifiwave2/registration-table/print');
+        } else if (isLegacyWirelessEnabled) {
+            console.log(`[API] Pacote wireless 'wireless' detectado em ${host}. Coletando métricas de Wi-Fi.`);
+            commands.push('/interface/wifiwave2/registration-table/print');
         } else {
             console.log(`[API] Pacote wireless não detectado ou desativado em ${host}. Pulando métricas de Wi-Fi.`);
         }
@@ -265,15 +331,20 @@ const collectMetrics = async (host) => {
         for (const cmd of commands) {
             try {
                 const res = await runCommand(cmd);
-                console.log(`[DADOS] Comando '${cmd}':`, JSON.stringify(res, null, 2));
                 if (!res) continue;
 
                 // normaliza para array
                 const rows = Array.isArray(res) ? res : (res ? [res] : []);
-                const baseMeasurement = cmd
+                let baseMeasurement = cmd
                     .replace(/^\//, '')
                     .replace(/\/print$/, '')
                     .replace(/\//g, '_') || 'unknown';
+
+                // [NOVO] Normaliza o nome da medição de Wi-Fi para consistência,
+                // independentemente do pacote (legacy vs wave2).
+                if (baseMeasurement === 'interface_wifiwave2_registration_table') {
+                    baseMeasurement = 'interface_wireless_registration_table';
+                }
 
                 // escreve cada item como ponto separado
                 rows.forEach(row => {
@@ -301,10 +372,9 @@ const collectMetrics = async (host) => {
             
             console.log(`[API] Encontradas ${interfaces.length} interfaces. Coletando dados individualmente...`);
             for (const iface of interfaces) {
-                const name = iface.name || iface['.id'];
+                const name = iface.name;
                 if (!name) continue;
 
-                console.log(`[API] Coletando dados para a interface "${name}"...`);
                 // Combina os dados estáticos (iface) com os dados de tráfego em tempo real
                 // SOLUÇÃO: Passa os argumentos como um array para lidar com espaços nos nomes
                 const trafficStats = await runCommand(
@@ -312,7 +382,11 @@ const collectMetrics = async (host) => {
                     [`=interface=${name}`, '=once=yes']
                 );
                 const combinedData = Object.assign({}, iface, trafficStats[0] || {});
-                console.log(`[DADOS] Interface '${name}':`, JSON.stringify(combinedData, null, 2));
+
+                // [NOVO] Remove a propriedade 'name' do objeto de dados para evitar redundância,
+                // uma vez que já estamos a passá-la como uma tag 'interface_name'.
+                // Isso garante que não haja confusão entre um campo 'name' e uma tag 'interface_name'.
+                delete combinedData.name;
 
                 // Escreve um único ponto de dados com todas as informações da interface
                 flattenAndWrite('interface_stats', combinedData, { interface_name: name }, host);
@@ -324,7 +398,7 @@ const collectMetrics = async (host) => {
         // Coleta de usuários do Hotspot
         try {
             if (typeof getHotspotActiveUsers === 'function') {
-                await getHotspotActiveUsers(host, client, flattenAndWrite);
+                await getHotspotActiveUsers(host, client, flattenAndWrite, runCommand);
             } else {
                 console.warn(`[API] Função getHotspotActiveUsers não definida — pulando coleta de usuários Hotspot para ${host}.`);
             }
