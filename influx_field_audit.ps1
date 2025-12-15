@@ -1,7 +1,7 @@
 $INFLUX_URL = "http://10.0.0.45:8086"
 $INFLUX_TOKEN = "T6M0gntRz3BX-q_huEoxfe11-raaAG-DKd-Byz1uMioSHw8OPsoPdpH5eY5o7RtgwY_vrhMo56lOVsWm1fVQXA=="
 $INFLUX_ORG = "RotaHotspot"
-$BUCKET = "monitoring"
+$BUCKET = "monitor"
 
 function Run-FluxCsv {
     param($flux)

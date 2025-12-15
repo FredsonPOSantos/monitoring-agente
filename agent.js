@@ -1,36 +1,27 @@
 // Carrega as variáveis de ambiente do ficheiro .env
 const dotenv = require('dotenv');
 const path = require('path');
-// [MODIFICADO] Carrega o .env de forma explícita para garantir que o caminho está correto.
 dotenv.config({ path: path.resolve(__dirname, '.env') });
 
-const { Pool } = require('pg'); // [NOVO] Importa o driver do PostgreSQL
+const { Pool } = require('pg');
 const { InfluxDB, Point } = require('@influxdata/influxdb-client');
 
-// Ajuste da importação para suportar o pacote 'node-routeros' que expõe RouterOSAPI
+// Ajuste da importação para suportar o pacote 'node-routeros'
 let RouterOSClient;
 try {
-    const _mod = require('node-routeros'); // pacote declarado no package.json
-    // tenta várias chaves possíveis de export
-    RouterOSClient = _mod.RouterOSClient ?? _mod.RouterOSAPI ?? _mod.default ?? _mod;
-    console.log('[AGENTE] Chaves do módulo node-routeros:', Object.keys(_mod));
+    const _mod = require('node-routeros');
+    RouterOSClient = _mod.RouterOSAPI || _mod.default || _mod;
 } catch (err) {
     console.error('[AGENTE] Não foi possível carregar "node-routeros":', err.message);
     console.error('Tente executar: npm install node-routeros --save');
     process.exit(1);
 }
 
-if (typeof RouterOSClient !== 'function') {
-    console.error('[AGENTE] RouterOSClient não é um construtor. Chaves do módulo:', Object.keys(require('node-routeros') || {}));
-    process.exit(1);
-}
-
 // --- 1. Configuração Inicial ---
-
 const INFLUX_URL = process.env.INFLUXDB_URL;
 const INFLUX_TOKEN = process.env.INFLUXDB_TOKEN;
 const INFLUX_ORG = process.env.INFLUXDB_ORG;
-const INFLUX_BUCKET = process.env.INFLUXDB_BUCKET;
+const INFLUX_BUCKET = 'monitor';
 
 const MIKROTIK_API_PORT = process.env.MIKROTIK_API_PORT || 8728;
 const MIKROTIK_USER = process.env.MIKROTIK_USER;
@@ -40,61 +31,44 @@ const DB_HOST = process.env.DB_HOST;
 const DB_USER = process.env.DB_USER;
 const DB_PASSWORD = process.env.DB_PASSWORD;
 const DB_DATABASE = process.env.DB_DATABASE;
-const DB_PORT = process.env.DB_PORT;
+const DB_PORT = process.env.DB_PORT || 5432;
 
-// Validação das variáveis de ambiente essenciais
+// Validação
 if (!INFLUX_URL || !INFLUX_TOKEN || !INFLUX_ORG || !INFLUX_BUCKET) {
-    console.error("❌ Erro: Uma ou mais variáveis de ambiente do InfluxDB (INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG, INFLUX_BUCKET) não estão definidas no seu ficheiro .env.");
-    console.error("Por favor, verifique o seu ficheiro .env e tente novamente.");
-    process.exit(1); // Termina o script com um código de erro.
+    console.error("❌ Erro: Variáveis do InfluxDB não definidas no .env.");
+    process.exit(1);
 }
 
-/**
- * [MODIFICADO] Busca a lista de roteadores diretamente do banco de dados PostgreSQL.
- * Se as credenciais do banco não estiverem configuradas, usa a variável ROUTER_HOSTS como fallback.
- */
-const getRoutersFromDB = async () => {
-    // [MODIFICADO] Simplificado para usar apenas variáveis DB_*
-    if (!DB_HOST || !DB_USER || !DB_DATABASE) {
-        console.warn('[AVISO] Variáveis do PostgreSQL não configuradas. A usar ROUTER_HOSTS do .env como fallback.');
-        if (!DB_HOST) console.warn('  - Causa: A variável de ambiente DB_HOST não foi encontrada no ficheiro .env.');
-        return process.env.ROUTER_HOSTS ? process.env.ROUTER_HOSTS.split(',').map(h => h.trim()) : [];
-    }
-
-    const pool = new Pool({
-        user: DB_USER, host: DB_HOST, database: DB_DATABASE, password: DB_PASSWORD, port: DB_PORT
-    });
-
-    try {
-        const res = await pool.query("SELECT ip_address FROM routers WHERE ip_address IS NOT NULL AND ip_address <> ''");
-        await pool.end();
-        return res.rows.map(row => row.ip_address.trim());
-    } catch (err) {
-        console.error('❌ [PostgreSQL] Erro ao buscar roteadores do banco de dados:', err.message);
-        await pool.end();
-        return []; // Retorna um array vazio em caso de erro para não parar o agente.
-    }
-};
+if (!MIKROTIK_USER || !MIKROTIK_PASSWORD) {
+    console.error("❌ Erro: Credenciais MikroTik não definidas.");
+    process.exit(1);
+}
 
 // --- 2. Cliente InfluxDB ---
 const influxDB = new InfluxDB({ url: INFLUX_URL, token: INFLUX_TOKEN });
 const writeApi = influxDB.getWriteApi(INFLUX_ORG, INFLUX_BUCKET);
-console.log(`[INFLUXDB] Cliente configurado para o bucket: ${INFLUX_BUCKET} 🚀`);
+console.log(`[INFLUXDB] Cliente configurado para o bucket: ${INFLUX_BUCKET}`);
 
-// Insira a seguir: utilitários e flattenAndWrite em escopo global
+// --- 3. Utilitários ---
 const sanitizeKey = (k) => String(k).replace(/[^a-zA-Z0-9_]/g,'_').replace(/^_+|_+$/g,'').toLowerCase();
-const isNumericString = (s) => /^[+-]?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(String(s).trim());
 
-/**
- * Converte a string de tempo do MikroTik (ex: 1w2d3h4m5s) para segundos.
- * @param {string} timeStr A string de tempo.
- * @returns {number} O total de segundos.
- */
+// Função para verificar se é número
+const isNumeric = (value) => {
+    if (value === null || value === undefined) return false;
+    const str = String(value).trim();
+    if (str === '' || str.toLowerCase() === 'na' || str.toLowerCase() === 'null' || 
+        str.toLowerCase() === 'undefined' || str === '-' || str === '--') {
+        return false;
+    }
+    const num = Number(str);
+    return !isNaN(num) && isFinite(num);
+};
+
+// Converte tempo MikroTik para segundos
 const parseMikroTikTime = (timeStr) => {
     if (!timeStr || typeof timeStr !== 'string') return 0;
     
     let totalSeconds = 0;
-    // Regex para capturar semanas, dias, horas, minutos e segundos
     const weeks = timeStr.match(/(\d+)w/);
     const days = timeStr.match(/(\d+)d/);
     const hours = timeStr.match(/(\d+)h/);
@@ -112,9 +86,13 @@ const parseMikroTikTime = (timeStr) => {
 
 // Campos a serem completamente ignorados durante a coleta.
 const ignoredFields = {
-    'hotspot_active': new Set(['.id']),
+    'interface_stats': new Set([
+        'mtu', 'actual-mtu', 'l2mtu', 'max-l2mtu', '.id', 'fp-rx-byte', 'fp-tx-byte', 
+        'fp-rx-packet', 'fp-tx-packet', 'fp-rx-packets-per-second', 'fp-tx-packets-per-second',
+        'fp-rx-bits-per-second', 'fp-tx-bits-per-second', 'comment', 'default_name', 'disabled',
+        'mac_address', 'running', 'slave', 'type'
+    ]),
     'system_resource': new Set([
-        'cpu-count', 'total-memory', 'total-hdd-space', 'bad-blocks', 
         'write-sect-since-reboot', 'write-sect-total', 'architecture-name', 
         'board-name', 'platform', 'build-time', 'factory-software'
     ]),
@@ -126,323 +104,466 @@ const ignoredFields = {
     ]),
     'ip_dhcp_server_lease': new Set([
         '.id', 'radius', 'dynamic', 'blocked', 'disabled', 'dhcp-option',
-        'age', 'expires-after', 'last-seen',
-        'age_seconds', 'expires_after_seconds', 'last_seen_seconds'
+        'expires_after', 'last_seen', 'expires-after', 'last-seen' // [NOVO] Ignora campos de tempo que causam conflito
     ]),
-    'interface_stats': new Set([
-        'mtu', 'actual-mtu', 'l2mtu', 'max-l2mtu',
-        'fp-rx-byte', 'fp-tx-byte', 'fp-rx-packet', 'fp-tx-packet',
-        'fp-rx-packets-per-second', 'fp-tx-packets-per-second',
-        'fp-rx-bits-per-second', 'fp-tx-bits-per-second'
+    'hotspot_active': new Set(['.id']),
+    'interface_wireless_registration_table': new Set([
+        '.id', 'authentication-type', 'encryption', 'group-encryption', 'wmm-enabled'
     ])
 };
 
-// Força campos específicos a serem tratados como STRING, mesmo que pareçam numéricos.
-// Essencial para IDs, versões, MACs, etc.
-const measurementForcedString = {
-    'hotspot_active': new Set(['.id', 'server', 'user', 'address', 'mac-address', 'uptime', 'session-time-left', 'comment']),
-    'interface_stats': new Set(['comment','default_name','disabled','.id','mac_address','running','slave','type']),
-    'ip_address': new Set(['actual_interface','address','disabled','dynamic','id','interface','invalid','network']),
-    'ip_arp': new Set(['address','dhcp','disabled','.id','interface','invalid','mac_address']),
-    'ip_dhcp_server_lease': new Set(['active_address','active_client_id','active_mac_address','active_server','address','address_lists','client_id','host_name','server','status', 'mac-address']),
-    'system_clock': new Set(['date','dst_active','gmt_offset','time_zone_autodetect','time_zone_name']),
-    'system_health': new Set(['id','name','type']), // 'value' será tratado como número
-    'system_resource': new Set(['architecture_name','board_name','build_time','factory_software','platform','version', 'uptime']),
-    'system_routerboard': new Set(['board_name','current_firmware','factory_firmware','firmware_type','model','routerboard','serial_number','upgrade_firmware']),
-    'user': new Set(['address','disabled','expired','group','id','last_logged_in','name'])
-};
+// Lista de campos que devem SEMPRE ser números (FLOAT)
+const alwaysNumericFields = new Set([
+    // Campos de interface
+    'rx_byte','tx_byte','rx_packet','tx_packet','rx_drop','tx_drop','tx_queue_drop','rx_error','tx_error',
+    'rx_packets_per_second','tx_packets_per_second','rx_bits_per_second','tx_bits_per_second',
+    'rx_drops_per_second','tx_drops_per_second','rx_errors_per_second','tx_errors_per_second','tx_queue_drops_per_second',
+    'link_downs',
+    
+    // Campos de sistema
+    'cpu_load','free_memory','total_memory','free_hdd_space','total_hdd_space',
+    'cpu_count','cpu_frequency','bad_blocks','write_sect_since_reboot','write_sect_total',
+    
+    // Campos de tempo convertidos (APENAS a versão em segundos)
+    'uptime_seconds','age_seconds','expires_after_seconds','last_seen_seconds','session_time_left_seconds',
+    
+    // Campos de hotspot
+    'bytes_in','bytes_out','packets_in','packets_out',
+    
+    // Campos wireless
+    'p_throughput','tx_ccq','signal_strength','signal_to_noise','strength_at_rates',
+    'rx_rate','tx_rate','packets','bytes','frames','frame_bytes','hw_frames','hw_frame_bytes',
+    
+    // Campo de saúde
+    'value'
+]);
 
-// Força campos específicos a serem tratados como NÚMEROS (inteiro ou float).
-// Crucial para métricas, contadores e valores que serão usados em cálculos e gráficos.
-const measurementForcedNumber = {
-    // Métricas de interface: tráfego, erros, quedas.
-    'interface_stats': new Set([
-        'link_downs',
-        'rx_byte','tx_byte','rx_packet','tx_packet','rx_drop','tx_drop','tx_queue_drop','rx_error','tx_error',
-        'fp_rx_byte','fp_tx_byte','fp_rx_packet','fp_tx_packet',
-        'rx_packets_per_second','tx_packets_per_second','rx_bits_per_second','tx_bits_per_second',
-        'fp_rx_packets_per_second','fp_tx_packets_per_second','fp_rx_bits_per_second','fp_tx_bits_per_second',
-        'rx_drops_per_second','tx_drops_per_second','rx_errors_per_second','tx_errors_per_second','tx_queue_drops_per_second'
-    ]),
-    // Métricas de recursos do sistema: CPU, memória, disco, etc.
-    'system_resource': new Set([
-        'cpu_load','free_memory','total_memory','free_hdd_space','total_hdd_space',
-        'cpu_count','cpu_frequency','bad_blocks','write_sect_since_reboot','write_sect_total',
-        'uptime_seconds' // Garante que a versão convertida seja numérica
-    ]),
-    // Métricas de saúde: voltagem, temperatura.
-    'system_health': new Set(['value']),
-};
+// Lista de campos que devem SEMPRE ser strings
+const alwaysStringFields = new Set([
+    // IDs e identificadores
+    '.id', 'id',
+    
+    // Endereços
+    'address', 'mac-address', 'mac_address', 'active_address', 'active_mac_address',
+    'server', 'active_server', 'host_name', 'client_id', 'active_client_id',
+    
+    // Nomes e descrições
+    'name', 'user', 'default_name', 'interface_name', 'actual_interface',
+    
+    // Status e tipos
+    'status', 'type', 'disabled', 'dynamic', 'invalid', 'running', 'slave',
+    'group', 'last_logged_in', 'expired', 'address_lists',
+    
+    // Interfaces e redes
+    'interface', 'network', 'ap', 'wds', 'routeros-version', 'last-ip',
+    
+    // DHCP
+    'dhcp', 'dhcp_option',
+    
+    // Tempo original (antes da conversão) - SEMPRE string
+    'uptime', 'age', 'expires_after', 'last_seen', 'session-time-left', 'date',
+    'dst_active', 'gmt_offset', 'time_zone_autodetect', 'time_zone_name',
+    
+    // Campos de tempo e estado - SEMPRE string para evitar conflitos
+    'idle_time', 'idle_timeout', 'keepalive_timeout', 
+    'last_link_down_time', 'last_link_up_time',
 
-const flattenAndWrite = (measurement, item, extraTags = {}, host) => {
-    const meas = String(measurement).toLowerCase();
+    // Wireless
+    'tx-rate-set', 'ssid', 'radio_name', 'security',
+    
+    // Adicionais para evitar conflitos
+    'comment', 'default-name'
+]);
+
+// Função principal para escrever dados - REVISADA
+const flattenAndWrite = (measurementName, item, extraTags = {}, host) => {
+    const meas = String(measurementName).toLowerCase();
     const p = new Point(meas).tag('router_host', host || 'unknown');
+    const debugFields = {}; // [DIAGNÓSTICO] Coleta campos para log
 
-    for (const [k, v] of Object.entries(extraTags || {})) p.tag(sanitizeKey(k), String(v));
+    // Adiciona tags extras
+    for (const [k, v] of Object.entries(extraTags || {})) {
+        if (v !== undefined && v !== null && v !== '') {
+            p.tag(sanitizeKey(k), String(v));
+        }
+    }
 
-    for (const [k, v] of Object.entries(item || {})) {
-        if (v === undefined || v === null) continue;
-        const sk = sanitizeKey(k);
+    // Processa cada campo do item
+    for (const [key, value] of Object.entries(item || {})) {
+        if (value === undefined || value === null) continue;
+        
+        const sanitizedKey = sanitizeKey(key);
+        const rawValue = String(value).trim();
 
-        // Verifica se o campo deve ser ignorado
-        if (ignoredFields[meas] && ignoredFields[meas].has(k)) {
+        // 1. Verifica se o campo deve ser ignorado
+        if (ignoredFields[meas] && (ignoredFields[meas].has(key) || ignoredFields[meas].has(sanitizedKey))) {
             continue;
         }
 
-        const raw = (typeof v === 'object') ? JSON.stringify(v) : String(v).trim();
-
-        if (measurementForcedString[meas] && measurementForcedString[meas].has(sk)) {
-            p.stringField(sk, raw);
+        // 2. Tratamento especial para cpu-load que pode vir com %
+        if (sanitizedKey === 'cpu_load' && typeof value === 'string' && value.includes('%')) {
+            const num = parseFloat(value.replace('%', ''));
+            if (!isNaN(num)) {
+                p.floatField(sanitizedKey, num);
+                debugFields[sanitizedKey] = num;
+                continue;
+            }
+        }
+ // 3. Campos que DEVEM ser strings
+        if (alwaysStringFields.has(sanitizedKey) || alwaysStringFields.has(key)) {
+            // Garante que valores vazios não sejam escritos
+    if (rawValue !== '') {
+                p.stringField(sanitizedKey, rawValue);
+                debugFields[sanitizedKey] = rawValue;
+            }
             continue;
         }
 
-        if (measurementForcedNumber[meas] && measurementForcedNumber[meas].has(sk)) {
-            if (isNumericString(raw)) {
-                if (raw.indexOf('.') !== -1 || /[eE]/.test(raw)) p.floatField(sk, Number(raw));
-                else p.intField(sk, parseInt(raw, 10));
+        // 4. Campos que DEVEM ser números (FLOAT)
+        if (alwaysNumericFields.has(sanitizedKey) || alwaysNumericFields.has(key)) {
+            if (isNumeric(value)) {
+                p.floatField(sanitizedKey, Number(value));
+                debugFields[sanitizedKey] = Number(value);
             } else {
-                console.warn(`[AGENTE] Campo NUMÉRICO esperado ignorado (não-numérico): ${meas}.${sk}="${raw}" router=${host}`);
+                // Se não for numérico, força 0.0 para manter tipo consistente
+                p.floatField(sanitizedKey, 0.0);
+                debugFields[sanitizedKey] = 0.0;
             }
             continue;
         }
 
-        if (isNumericString(raw)) {
-            if (raw.indexOf('.') !== -1 || /[eE]/.test(raw)) p.floatField(sk, Number(raw));
-            else {
-                const iv = parseInt(raw, 10);
-                if (Number.isNaN(iv)) p.stringField(sk, raw); else p.intField(sk, iv);
-            }
-        } else {
-            p.stringField(sk, raw);
+        // 5. Campos não especificados: decide baseado no valor
+        // Para evitar conflitos de schema, ignora campos desconhecidos
+        if (isNumeric(value)) {
+            // Se for numérico, escreve como float
+            p.floatField(sanitizedKey, Number(value));
+            debugFields[sanitizedKey] = Number(value);
         }
+        // Campos não numéricos e não especificados são ignorados
     }
 
     try {
+        // [DIAGNÓSTICO] Log do que está sendo gravado
+        console.log(`[GRAVANDO] ${meas} | Host: ${host} | Campos:`, JSON.stringify(debugFields));
         writeApi.writePoint(p);
     } catch (e) {
-        console.error(`[INFLUXDB] Erro ao escrever ponto ${measurement}:`, e.message);
+        console.error(`[INFLUXDB] Erro ao escrever ponto ${measurementName}:`, e.message);
     }
 };
 
-/**
- * Coleta os usuários ativos do Hotspot.
- */
+// Coleta usuários do Hotspot
 const getHotspotActiveUsers = async (host, client, writer, runCommand) => {
     try {
         const hotspotUsers = await runCommand('/ip/hotspot/active/print');
         if (hotspotUsers && hotspotUsers.length > 0) {
-            console.log(`[API-DEBUG] Encontrados ${hotspotUsers.length} usuários ativos no Hotspot em ${host}.`);
+            console.log(`[API] ${hotspotUsers.length} usuários ativos no Hotspot em ${host}.`);
             hotspotUsers.forEach(user => {
-                // O 'user' pode não existir para clientes não autenticados, mas o mac_address sim.
+                const filteredUser = { ...user };
+                delete filteredUser['.id'];
+                
                 const tags = user.user ? { user: user.user } : {};
-                writer('hotspot_active', user, tags, host);
+                writer('hotspot_active', filteredUser, tags, host);
             });
         }
     } catch (e) {
-        // Não é um erro crítico se o hotspot não estiver configurado.
-        console.warn(`[API] Aviso ao coletar usuários ativos do Hotspot em ${host}: ${e.message}`);
+        console.warn(`[API] Hotspot em ${host}: ${e.message}`);
     }
 };
 
-/**
- * Conecta-se a um roteador MikroTik e coleta métricas.
- * Compatibilidade: tenta usar métodos comuns (connect/open, write/menu, close/disconnect).
- */
+// Pool do PostgreSQL
+let pgPool = null;
+const getPgPool = () => {
+    if (!pgPool && DB_HOST && DB_USER && DB_DATABASE) {
+        pgPool = new Pool({
+            user: DB_USER,
+            host: DB_HOST,
+            database: DB_DATABASE,
+            password: DB_PASSWORD,
+            port: DB_PORT,
+            max: 10,
+            idleTimeoutMillis: 30000,
+            connectionTimeoutMillis: 2000
+        });
+    }
+    return pgPool;
+};
+
+// Busca a lista de roteadores do PostgreSQL.
+const getRoutersFromDB = async () => {
+    if (!DB_HOST || !DB_USER || !DB_DATABASE) {
+        console.warn('[AVISO] PostgreSQL não configurado. Usando ROUTER_HOSTS do .env.');
+        return process.env.ROUTER_HOSTS ? process.env.ROUTER_HOSTS.split(',').map(h => h.trim()) : [];
+    }
+
+    const pool = getPgPool();
+    if (!pool) {
+        console.warn('[AVISO] Pool PostgreSQL não disponível.');
+        return [];
+    }
+
+    try {
+        const res = await pool.query("SELECT ip_address FROM routers WHERE ip_address IS NOT NULL AND ip_address <> ''");
+        return res.rows.map(row => row.ip_address.trim());
+    } catch (err) {
+        console.error('❌ [PostgreSQL] Erro:', err.message);
+        return [];
+    }
+};
+
+// Coleta métricas de um roteador
 const collectMetrics = async (host) => {
-    console.log(`[API] A conectar-se a ${host}:${MIKROTIK_API_PORT}...`);
+    console.log(`[${new Date().toISOString()}] [AGENT] ⏳ Iniciando coleta para ${host}...`);
 
     const client = new RouterOSClient({
         host: host,
         port: MIKROTIK_API_PORT,
-        username: MIKROTIK_USER,
         user: MIKROTIK_USER,
         password: MIKROTIK_PASSWORD,
-        timeout: 5,
+        timeout: 15,
+        keepalive: false
     });
 
-    // [NOVO] Adiciona um listener de erro para prevenir que o processo caia.
-    // O erro de timeout é um evento 'error' que, se não for capturado, quebra a aplicação.
-    client.on('error', (err) => {
-        // Apenas registamos o evento aqui. O tratamento principal do erro (a mensagem para o utilizador)
-        // já é feito no bloco `catch` principal desta função.
-    });
-
-    const doConnect = async () => {
-        if (typeof client.connect === 'function') return client.connect();
-        if (typeof client.open === 'function') return client.open();
-        if (typeof client.connectSocket === 'function') return client.connectSocket();
-        return Promise.resolve();
-    };
-    const doClose = async () => {
-        if (typeof client.close === 'function') return client.close();
-        if (typeof client.disconnect === 'function') return client.disconnect();
-        if (typeof client.end === 'function') return client.end();
-        return Promise.resolve();
-    };
-
-    // executor compatível: tenta client.write(...) ou client.menu(...).get()
     const runCommand = async (cmd, args = []) => {
         try {
-            if (typeof client.write === 'function') {
-                return await client.write(cmd, args);
-            } else if (typeof client.menu === 'function') {
-                // transforma "/system/resource/print" -> "/system/resource"
-                const menuPath = '/' + cmd.replace(/^\/|\/print$/g, '').replace(/\/$/, '');
-                return await client.menu(menuPath).get();
-            } else {
-                throw new Error('Nenhum método conhecido para executar comandos no cliente RouterOS.');
-            }
+            return await client.write(cmd, args);
         } catch (e) {
             throw e;
         }
     };
 
     try {
-        await doConnect();
-        console.log(`[API] Conectado com sucesso a ${host}. Coletando métricas...`);
+        // Conectar
+        await client.connect();
+        console.log(`[API] Conectado a ${host}. Coletando...`);
 
-        // --- Verificação de Capacidades (Capabilities) ---
+        // Verificar pacotes
         const packages = await runCommand('/system/package/print');
-        console.log(`[API-DEBUG] Pacotes instalados em ${host}:`, JSON.stringify(packages.map(p => ({ name: p.name, disabled: p.disabled }))));
         const isWave2Enabled = packages.some(pkg => pkg.name === 'wifiwave2' && pkg.disabled === 'false');
         const isLegacyWirelessEnabled = packages.some(pkg => pkg.name === 'wireless' && pkg.disabled === 'false');
 
-        // --- Construção da Lista de Comandos Dinâmica ---
-        // [MODIFICADO] Comandos removidos e duplicatas limpas.
+        // Comandos básicos
         const commands = [
-            '/system/resource/print',      // Métricas vitais: CPU, memória, uptime
-            '/system/clock/print',         // Data e hora do sistema
-            '/ip/address/print',           // Endereços IP configurados,
-            '/ip/arp/print',               // Tabela ARP (IPs e MACs na rede)
-            '/ip/dhcp-server/lease/print', // Clientes DHCP ativos
-            '/user/print'                  // Utilizadores configurados no router
+            '/system/resource/print',
+            '/system/clock/print',
+            '/ip/address/print',
+            // '/ip/arp/print', // Desativado para focar em dados numéricos
+            '/ip/dhcp-server/lease/print', // [ATIVADO] Coleta de clientes DHCP.
+            '/user/print'
         ];
 
+        // Adicionar comando wireless apropriado
         if (isWave2Enabled) {
-            console.log(`[API] Pacote wireless 'wifiwave2' detectado em ${host}. Coletando métricas de Wi-Fi.`);
+            console.log(`[API] wifiwave2 detectado em ${host}.`);
             commands.push('/interface/wifiwave2/registration-table/print');
         } else if (isLegacyWirelessEnabled) {
-            console.log(`[API] Pacote wireless 'wireless' detectado em ${host}. Coletando métricas de Wi-Fi.`);
-            commands.push('/interface/wifiwave2/registration-table/print');
-        } else {
-            console.log(`[API] Pacote wireless não detectado ou desativado em ${host}. Pulando métricas de Wi-Fi.`);
+            console.log(`[API] wireless detectado em ${host}.`);
+            commands.push('/interface/wireless/registration-table/print');
         }
 
+        // Executar comandos
         for (const cmd of commands) {
             try {
                 const res = await runCommand(cmd);
                 if (!res) continue;
 
-                // normaliza para array
-                const rows = Array.isArray(res) ? res : (res ? [res] : []);
-                let baseMeasurement = cmd
+                const rows = Array.isArray(res) ? res : [res];
+                let measurement = cmd
                     .replace(/^\//, '')
                     .replace(/\/print$/, '')
-                    .replace(/\//g, '_') || 'unknown';
+                    .replace(/\//g, '_')
+                    .replace(/-/g, '_');
 
-                // [NOVO] Normaliza o nome da medição de Wi-Fi para consistência,
-                // independentemente do pacote (legacy vs wave2).
-                if (baseMeasurement === 'interface_wifiwave2_registration_table') {
-                    baseMeasurement = 'interface_wireless_registration_table';
+                // Normalizar nome da medição wireless
+                if (measurement === 'interface_wifiwave2_registration_table') {
+                    measurement = 'interface_wireless_registration_table';
                 }
 
-                // escreve cada item como ponto separado
+                // Processar cada linha
                 rows.forEach(row => {
-                    // [NOVO] Converte campos de tempo específicos para segundos
-                    if (baseMeasurement === 'system_resource' && row.uptime) {
-                        row.uptime_seconds = parseMikroTikTime(row.uptime);
+                    const filteredRow = { ...row };
+                    
+                    // Converter campos de tempo e adicionar versão em segundos
+                    // IMPORTANTE: Remover campos originais de tempo para evitar conflitos
+                    if (measurement === 'system_resource' && row.uptime) {
+                        filteredRow.uptime_seconds = parseMikroTikTime(row.uptime);
+                        // REMOVE o campo original para evitar conflito string/float
+                        delete filteredRow.uptime;
                     }
-                    if (baseMeasurement === 'ip_dhcp_server_lease') {
-                        if (row.age) row.age_seconds = parseMikroTikTime(row.age);
-                        if (row.expires_after) row.expires_after_seconds = parseMikroTikTime(row.expires_after);
-                        if (row.last_seen) row.last_seen_seconds = parseMikroTikTime(row.last_seen);
+                    
+                    if (measurement === 'ip_dhcp_server_lease') {
+                        if (row.age) {
+                            filteredRow.age_seconds = parseMikroTikTime(row.age);
+                            delete filteredRow.age; // Remove original
+                        }
+                        // [REMOVIDO] Conversão de expires_after e last_seen removida conforme solicitado
                     }
-                    flattenAndWrite(baseMeasurement, row, {}, host);
+                    
+                    if (measurement === 'interface_wireless_registration_table' && row.uptime) {
+                        filteredRow.uptime_seconds = parseMikroTikTime(row.uptime);
+                        delete filteredRow.uptime; // Remove original
+                    }
+                    
+                    flattenAndWrite(measurement, filteredRow, {}, host);
                 });
             } catch (e) {
-                console.warn(`[API] Falha ao executar comando "${cmd}" em ${host}: ${e.message}`);
+                console.warn(`[API] Comando "${cmd}" em ${host}: ${e.message}`);
             }
         }
 
-        // --- Coleta Individual de Métricas de Interface ---
+        // Coletar métricas de interface - REVISADO
         try {
-            console.log(`[API] Buscando lista de interfaces em ${host}...`);
             const intfRes = await runCommand('/interface/print');
-            const interfaces = Array.isArray(intfRes) ? intfRes : (intfRes ? [intfRes] : []);
+            const interfaces = Array.isArray(intfRes) ? intfRes : [intfRes];
             
-            console.log(`[API] Encontradas ${interfaces.length} interfaces. Coletando dados individualmente...`);
             for (const iface of interfaces) {
                 const name = iface.name;
                 if (!name) continue;
 
-                // Combina os dados estáticos (iface) com os dados de tráfego em tempo real
-                // SOLUÇÃO: Passa os argumentos como um array para lidar com espaços nos nomes
+                // Pular interfaces específicas que causam problemas
+                if (name.includes('bridge') || name.includes('vlan') || name.includes('ppp')) {
+                    continue;
+                }
+
                 const trafficStats = await runCommand(
                     '/interface/monitor-traffic', 
                     [`=interface=${name}`, '=once=yes']
                 );
-                const combinedData = Object.assign({}, iface, trafficStats[0] || {});
-
-                // [NOVO] Remove a propriedade 'name' do objeto de dados para evitar redundância,
-                // uma vez que já estamos a passá-la como uma tag 'interface_name'.
-                // Isso garante que não haja confusão entre um campo 'name' e uma tag 'interface_name'.
-                delete combinedData.name;
-
-                // Escreve um único ponto de dados com todas as informações da interface
-                flattenAndWrite('interface_stats', combinedData, { interface_name: name }, host);
+                
+                if (trafficStats && trafficStats[0]) {
+                    const stats = trafficStats[0];
+                    
+                    // Criar objeto limpo com APENAS campos numéricos conhecidos
+                    const interfaceData = {
+                        rx_byte: stats['rx-byte'] || 0,
+                        tx_byte: stats['tx-byte'] || 0,
+                        rx_packet: stats['rx-packet'] || 0,
+                        tx_packet: stats['tx-packet'] || 0,
+                        rx_drop: stats['rx-drop'] || 0,
+                        tx_drop: stats['tx-drop'] || 0,
+                        rx_error: stats['rx-error'] || 0,
+                        tx_error: stats['tx-error'] || 0,
+                        rx_packets_per_second: stats['rx-packets-per-second'] || 0,
+                        tx_packets_per_second: stats['tx-packets-per-second'] || 0,
+                        rx_bits_per_second: stats['rx-bits-per-second'] || 0,
+                        tx_bits_per_second: stats['tx-bits-per-second'] || 0
+                    };
+                    
+                    flattenAndWrite('interface_stats', interfaceData, { 
+                        interface_name: name,
+                        interface_type: iface.type || 'unknown'
+                    }, host);
+                }
             }
         } catch (e) {
-            console.warn(`[API] Falha ao coletar métricas de interface em ${host}: ${e.message}`);
+            console.warn(`[API] Interfaces em ${host}: ${e.message}`);
         }
 
-        // Coleta de usuários do Hotspot
+        // Coletar usuários Hotspot (com tratamento especial)
         try {
-            if (typeof getHotspotActiveUsers === 'function') {
-                await getHotspotActiveUsers(host, client, flattenAndWrite, runCommand);
-            } else {
-                console.warn(`[API] Função getHotspotActiveUsers não definida — pulando coleta de usuários Hotspot para ${host}.`);
+            const hotspotUsers = await runCommand('/ip/hotspot/active/print');
+            if (hotspotUsers && hotspotUsers.length > 0) {
+                console.log(`[API] ${hotspotUsers.length} usuários ativos no Hotspot em ${host}.`);
+                hotspotUsers.forEach(user => {
+                    const filteredUser = { 
+                        user: user.user || '',
+                        address: user.address || '',
+                        mac_address: user['mac-address'] || '',
+                        bytes_in: user['bytes-in'] || 0,
+                        bytes_out: user['bytes-out'] || 0,
+                        packets_in: user['packets-in'] || 0,
+                        packets_out: user['packets-out'] || 0,
+                        uptime_seconds: parseMikroTikTime(user.uptime || '0s'),
+                        session_time_left_seconds: parseMikroTikTime(user['session-time-left'] || '0s')
+                    };
+                    
+                    const tags = user.user ? { user: user.user } : {};
+                    flattenAndWrite('hotspot_active', filteredUser, tags, host);
+                });
             }
-        } catch (err) {
-            console.error(`[API] Falha ao conectar ou coletar métricas para ${host}: ${err.message}`);
+        } catch (e) {
+            console.warn(`[API] Hotspot em ${host}: ${e.message}`);
         }
 
-        await doClose();
-        console.log(`[API] Métricas coletadas de ${host}.`);
+        // Desconectar
+        await client.close();
+        console.log(`[${new Date().toISOString()}] [AGENT] ✅ Coleta finalizada para ${host}.`);
     } catch (err) {
-        console.error(`❌ [API] Falha ao conectar ou coletar métricas para ${host}: ${err.message}`);
-        try { await doClose(); } catch (_) {}
+        console.error(`❌ [API] Falha em ${host}: ${err.message}`);
+        try { 
+            await client.close(); 
+        } catch (_) {
+            // Ignora erros de fechamento
+        }
     }
 };
 
-// --- 4. Ciclo Principal de Monitorização ---
-
+// --- 4. Ciclo Principal ---
 const runMonitoringCycle = async () => {
-    console.log('\n--- [CICLO DE MONITORIZAÇÃO] Iniciando... ---');
-    const routerHosts = await getRoutersFromDB();
-    console.log(`[CONFIG] Roteadores a serem monitorizados: ${routerHosts.join(', ')}`);
+    console.log(`\n[${new Date().toISOString()}] 🔄 --- [CICLO] Iniciando novo ciclo de monitoramento ---`);
+    
+    let routerHosts = [];
+    try {
+        routerHosts = await getRoutersFromDB();
+        console.log(`[CONFIG] ${routerHosts.length} roteadores encontrados: ${routerHosts.join(', ')}`);
+    } catch (err) {
+        console.error('❌ Erro ao obter lista de roteadores:', err.message);
+        return;
+    }
 
-    // Processar cada roteador em paralelo
-    await Promise.all(routerHosts.map(host => collectMetrics(host)));
+    if (routerHosts.length === 0) {
+        console.warn('[AVISO] Nenhum roteador configurado. Aguardando próximo ciclo.');
+        return;
+    }
+
+    // Processar em sequência para evitar sobrecarga
+    for (const host of routerHosts) {
+        await collectMetrics(host);
+    }
 
     try {
         await writeApi.flush();
-        console.log('[INFLUXDB] Lote de dados enviado com sucesso para a InfluxDB.');
+        console.log(`[${new Date().toISOString()}] [INFLUXDB] 📤 Buffer enviado para o banco.`);
     } catch (e) {
-        console.error('❌ [INFLUXDB] Erro ao enviar dados:', e);
+        console.error('❌ [INFLUXDB] Erro:', e);
     }
 
-    console.log('--- [CICLO DE MONITORIZAÇÃO] Ciclo concluído. A aguardar o próximo... ---');
+    console.log(`[${new Date().toISOString()}] ✅ --- [CICLO] Ciclo concluído. Aguardando próximo. ---`);
 };
 
+// Limpeza de recursos
+const cleanup = () => {
+    console.log('[AGENTE] Encerrando...');
+    if (pgPool) {
+        pgPool.end();
+    }
+    writeApi.close();
+};
+
+// Iniciar agente
 const startAgent = () => {
-    const intervalSeconds = 60;
-    console.log(`[AGENTE DE MONITORIZAÇÃO] Serviço iniciado. A executar o ciclo de monitorização a cada ${intervalSeconds} segundos.`);
+    const intervalSeconds = 30;
+    console.log(`[AGENTE] Iniciado. Ciclo a cada ${intervalSeconds} segundos.`);
+    console.warn(`[AGENTE-DEBUG] Coleta de ARP está desativada. Coleta de DHCP está ATIVADA.`);
     
-    // Executa imediatamente na primeira vez
+    // Executar imediatamente
     runMonitoringCycle();
     
-    // E depois a cada X segundos
-    setInterval(runMonitoringCycle, intervalSeconds * 1000);
+    // Agendar próximo ciclo - CORRIGIDO: usar intervalSeconds * 1000
+    const interval = setInterval(runMonitoringCycle, intervalSeconds * 1000);
+    
+    // Configurar handlers para encerramento
+    process.on('SIGINT', () => {
+        clearInterval(interval);
+        cleanup();
+        process.exit(0);
+    });
+    
+    process.on('SIGTERM', () => {
+        clearInterval(interval);
+        cleanup();
+        process.exit(0);
+    });
 };
 
+// Iniciar
 startAgent();
