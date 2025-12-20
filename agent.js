@@ -6,6 +6,17 @@ dotenv.config({ path: path.resolve(__dirname, '.env') });
 const { Pool } = require('pg');
 const { InfluxDB, Point } = require('@influxdata/influxdb-client');
 
+// --- GUARDIÃO INTERNO: Previne que o agente pare em caso de erros ---
+process.on('uncaughtException', (err) => {
+    console.error(`[SISTEMA] ⚠️ Erro crítico capturado (o agente continuará rodando): ${err.message}`);
+    // Não sai do processo (process.exit), permitindo que o setInterval continue
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[SISTEMA] ⚠️ Promessa rejeitada não tratada:', reason);
+});
+// -------------------------------------------------------------------
+
 // Ajuste da importação para suportar o pacote 'node-routeros'
 let RouterOSClient;
 try {
@@ -149,6 +160,7 @@ const alwaysStringFields = new Set([
     
     // Nomes e descrições
     'name', 'user', 'default_name', 'interface_name', 'actual_interface',
+    'version', // [NOVO] Informações de hardware e versão
     
     // Status e tipos
     'status', 'type', 'disabled', 'dynamic', 'invalid', 'running', 'slave',
@@ -288,6 +300,49 @@ const getPgPool = () => {
     return pgPool;
 };
 
+// [NOVO] Inicializa tabela de logs no PostgreSQL
+const initLogTable = async () => {
+    const pool = getPgPool();
+    if (!pool) return;
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS connection_logs (
+                id SERIAL PRIMARY KEY,
+                router_host VARCHAR(50),
+                level VARCHAR(20),
+                message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        console.log('[DB] Tabela de logs verificada/criada.');
+    } catch (e) {
+        console.error('[DB] Erro ao criar tabela de logs:', e.message);
+    }
+};
+
+// [NOVO] Função centralizada para salvar logs (Console + Banco)
+const logToDB = async (level, message, host = null) => {
+    const prefix = host ? `[${host}]` : `[SISTEMA]`;
+    
+    // 1. Log no Console (mantém o comportamento visual atual)
+    if (level === 'ERROR') console.error(`${prefix} ❌ ${message}`);
+    else if (level === 'WARN') console.warn(`${prefix} ⚠️ ${message}`);
+    else console.log(`${prefix} ℹ️ ${message}`);
+
+    // 2. Log no Banco de Dados
+    const pool = getPgPool();
+    if (!pool) return;
+
+    try {
+        await pool.query(
+            'INSERT INTO connection_logs (router_host, level, message, created_at) VALUES ($1, $2, $3, NOW())',
+            [host, level, message]
+        );
+    } catch (e) {
+        console.error(`[DB] Erro ao salvar log: ${e.message}`);
+    }
+};
+
 // Busca a lista de roteadores do PostgreSQL.
 const getRoutersFromDB = async () => {
     if (!DB_HOST || !DB_USER || !DB_DATABASE) {
@@ -305,7 +360,7 @@ const getRoutersFromDB = async () => {
         const res = await pool.query("SELECT ip_address FROM routers WHERE ip_address IS NOT NULL AND ip_address <> ''");
         return res.rows.map(row => row.ip_address.trim());
     } catch (err) {
-        console.error('❌ [PostgreSQL] Erro:', err.message);
+        logToDB('ERROR', `Erro PostgreSQL ao buscar roteadores: ${err.message}`);
         return [];
     }
 };
@@ -323,9 +378,20 @@ const collectMetrics = async (host) => {
         keepalive: false
     });
 
+    // [CORREÇÃO] Adiciona listener para erros de conexão (evita o crash "Unhandled 'error' event")
+    client.on('error', (err) => {
+        logToDB('ERROR', `Erro de conexão (Socket): ${err.message}`, host);
+    });
+
     const runCommand = async (cmd, args = []) => {
         try {
-            return await client.write(cmd, args);
+            // [MELHORIA] Timeout forçado por comando (10s).
+            // Essencial para 4G/Ônibus: Se o sinal cair DURANTE o comando, evita que o agente fique travado esperando.
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Timeout: O roteador parou de responder (possível perda de sinal)')), 10000)
+            );
+            
+            return await Promise.race([client.write(cmd, args), timeoutPromise]);
         } catch (e) {
             throw e;
         }
@@ -488,7 +554,7 @@ const collectMetrics = async (host) => {
         await client.close();
         console.log(`[${new Date().toISOString()}] [AGENT] ✅ Coleta finalizada para ${host}.`);
     } catch (err) {
-        console.error(`❌ [API] Falha em ${host}: ${err.message}`);
+        logToDB('ERROR', `Falha na coleta: ${err.message}`, host);
         try { 
             await client.close(); 
         } catch (_) {
@@ -524,7 +590,7 @@ const runMonitoringCycle = async () => {
         await writeApi.flush();
         console.log(`[${new Date().toISOString()}] [INFLUXDB] 📤 Buffer enviado para o banco.`);
     } catch (e) {
-        console.error('❌ [INFLUXDB] Erro:', e);
+        logToDB('ERROR', `Erro InfluxDB: ${e.message || e}`);
     }
 
     console.log(`[${new Date().toISOString()}] ✅ --- [CICLO] Ciclo concluído. Aguardando próximo. ---`);
@@ -540,7 +606,9 @@ const cleanup = () => {
 };
 
 // Iniciar agente
-const startAgent = () => {
+const startAgent = async () => {
+    await initLogTable(); // Garante que a tabela de logs existe antes de começar
+
     const intervalSeconds = 30;
     console.log(`[AGENTE] Iniciado. Ciclo a cada ${intervalSeconds} segundos.`);
     console.warn(`[AGENTE-DEBUG] Coleta de ARP está desativada. Coleta de DHCP está ATIVADA.`);
