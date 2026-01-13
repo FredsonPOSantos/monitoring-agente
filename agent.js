@@ -256,7 +256,7 @@ const flattenAndWrite = (measurementName, item, extraTags = {}, host) => {
 
     try {
         // [DIAGNÓSTICO] Log do que está sendo gravado
-        console.log(`[GRAVANDO] ${meas} | Host: ${host} | Campos:`, JSON.stringify(debugFields));
+        // console.log(`[GRAVANDO] ${meas} | Host: ${host} | Campos:`, JSON.stringify(debugFields));
         writeApi.writePoint(p);
     } catch (e) {
         console.error(`[INFLUXDB] Erro ao escrever ponto ${measurementName}:`, e.message);
